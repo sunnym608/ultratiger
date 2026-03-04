@@ -1,5 +1,6 @@
--- Ultra Tiger Memory Schema v1
--- Local-first layout with support for semantic retrieval and auditability.
+-- Ultra Tiger Memory + Orchestration Schema v2
+-- Local-first layout with support for semantic retrieval, auditability,
+-- and persistent autonomous queue processing.
 
 CREATE TABLE IF NOT EXISTS memory_records (
   id TEXT PRIMARY KEY,
@@ -35,8 +36,49 @@ CREATE TABLE IF NOT EXISTS guardian_daily_spend (
   updated_at_unix INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_queue (
+  id TEXT PRIMARY KEY,
+  task_type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  max_attempts INTEGER NOT NULL,
+  available_at_unix INTEGER NOT NULL,
+  last_error TEXT,
+  created_at_unix INTEGER NOT NULL,
+  updated_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+  id TEXT PRIMARY KEY,
+  task_type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  trigger_kind TEXT NOT NULL,
+  trigger_expr TEXT NOT NULL,
+  max_attempts INTEGER NOT NULL,
+  enabled INTEGER NOT NULL,
+  next_run_unix INTEGER NOT NULL,
+  updated_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dead_letter_queue (
+  task_id TEXT PRIMARY KEY,
+  task_type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  max_attempts INTEGER NOT NULL,
+  last_error TEXT,
+  failed_at_unix INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_memory_records_session_time
   ON memory_records(session_id, created_at_unix DESC);
 
 CREATE INDEX IF NOT EXISTS idx_memory_records_source_time
   ON memory_records(source, created_at_unix DESC);
+
+CREATE INDEX IF NOT EXISTS idx_task_queue_due
+  ON task_queue(status, available_at_unix);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+  ON scheduled_jobs(enabled, next_run_unix);

@@ -71,6 +71,36 @@ pub struct QueueStatusResponse {
     pub dead_letter: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScheduleTaskRequest {
+    pub id: String,
+    pub task_type: String,
+    pub payload: String,
+    pub trigger_kind: String,
+    pub trigger_expr: String,
+    pub max_attempts: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RequeueDeadLetterRequest {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeadLetterTaskResponse {
+    pub task_id: String,
+    pub task_type: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub last_error: Option<String>,
+    pub failed_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SchedulerTickResponse {
+    pub fired_jobs: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
