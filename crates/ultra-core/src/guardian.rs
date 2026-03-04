@@ -103,6 +103,7 @@ mod tests {
         let mut guardian = Guardian::new(AppConfig {
             daily_budget_limit_usd: 1.0,
             preflight_authorize_threshold_usd: 0.10,
+            ..AppConfig::default()
         });
         guardian.register_spend(1.2);
         assert!(guardian.keys_revoked());
@@ -113,6 +114,7 @@ mod tests {
         let mut guardian = Guardian::new(AppConfig {
             daily_budget_limit_usd: 1.0,
             preflight_authorize_threshold_usd: 0.10,
+            ..AppConfig::default()
         });
         guardian.register_spend(1.2);
         guardian.manual_reset();

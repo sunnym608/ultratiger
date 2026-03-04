@@ -5,7 +5,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::autonomy::{
     compute_retry_delay_seconds, next_schedule_run_unix, SchedulerTrigger, TaskItem,
 };
-use crate::memory::{MemoryQuery, MemoryRecord, MemoryStore};
+use crate::memory::{
+    cosine_similarity, embed_text_deterministic, keyword_overlap_score, MemoryChunk, MemoryQuery,
+    MemoryRecord, MemoryStore, RetrievedMemory,
+};
 
 #[derive(Debug, Clone)]
 pub struct ApprovalEvent {
@@ -45,10 +48,25 @@ pub struct DeadLetterTask {
     pub failed_at_unix: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct MemoryRetrievalResult {
+    pub record_id: String,
+    pub session_id: String,
+    pub source: String,
+    pub chunk_index: u32,
+    pub chunk_text: String,
+    pub semantic_score: f32,
+    pub keyword_score: f32,
+    pub final_score: f32,
+    pub created_at_unix: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
     #[error("sqlite error: {0}")]
     Sqlite(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
 }
 
 pub struct SqliteMemoryStore {
@@ -106,6 +124,168 @@ impl SqliteMemoryStore {
                 ],
             )
             .map(|_| ())
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
+    pub fn ingest_memory_with_embeddings(
+        &self,
+        record: &MemoryRecord,
+        model: &str,
+        chunk_size: usize,
+        dimensions: usize,
+    ) -> Result<usize, PersistenceError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO memory_records (id, session_id, source, content, created_at_unix) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record.id,
+                    record.session_id,
+                    record.source,
+                    record.content,
+                    record.created_at_unix as i64
+                ],
+            )
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+
+        let chunks = crate::memory::chunk_text(&record.content, chunk_size)
+            .into_iter()
+            .map(|(idx, text)| MemoryChunk {
+                chunk_index: idx,
+                embedding: embed_text_deterministic(&text, dimensions),
+                chunk_text: text,
+            })
+            .collect::<Vec<_>>();
+
+        for chunk in &chunks {
+            self.store_embedding(&record.id, model, chunk, record.created_at_unix)?;
+        }
+
+        Ok(chunks.len())
+    }
+
+    fn store_embedding(
+        &self,
+        record_id: &str,
+        model: &str,
+        chunk: &MemoryChunk,
+        created_at_unix: u64,
+    ) -> Result<(), PersistenceError> {
+        let embedding_blob = serde_json::to_vec(&chunk.embedding)
+            .map_err(|err| PersistenceError::Serialization(err.to_string()))?;
+
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO memory_embeddings
+                 (record_id, model, chunk_index, chunk_text, dimensions, embedding_blob, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    record_id,
+                    model,
+                    chunk.chunk_index as i64,
+                    chunk.chunk_text,
+                    chunk.embedding.len() as i64,
+                    embedding_blob,
+                    created_at_unix as i64,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
+    pub fn retrieve_hybrid(
+        &self,
+        query: &str,
+        model: &str,
+        session_id: Option<&str>,
+        source: Option<&str>,
+        top_k: usize,
+        dimensions: usize,
+    ) -> Result<Vec<MemoryRetrievalResult>, PersistenceError> {
+        let query_emb = embed_text_deterministic(query, dimensions);
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mr.id, mr.session_id, mr.source, mr.created_at_unix,
+                        me.chunk_index, me.chunk_text, me.embedding_blob
+                 FROM memory_records mr
+                 JOIN memory_embeddings me ON me.record_id = mr.id
+                 WHERE me.model = ?1
+                   AND (?2 IS NULL OR mr.session_id = ?2)
+                   AND (?3 IS NULL OR mr.source = ?3)
+                 ORDER BY mr.created_at_unix DESC",
+            )
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![model, session_id, source], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)? as u32,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            })
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+
+        let mut scored = Vec::new();
+        for row in rows.flatten() {
+            let (record_id, session_id, source, created_at_unix, chunk_index, chunk_text, blob) =
+                row;
+            let emb: Vec<f32> = serde_json::from_slice(&blob)
+                .map_err(|err| PersistenceError::Serialization(err.to_string()))?;
+            let semantic = cosine_similarity(&query_emb, &emb);
+            let keyword = keyword_overlap_score(query, &chunk_text);
+            let final_score = (0.7 * semantic) + (0.3 * keyword);
+
+            scored.push(MemoryRetrievalResult {
+                record_id,
+                session_id,
+                source,
+                chunk_index,
+                chunk_text,
+                semantic_score: semantic,
+                keyword_score: keyword,
+                final_score,
+                created_at_unix,
+            });
+        }
+
+        scored.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
+        scored.truncate(top_k.max(1));
+        Ok(scored)
+    }
+
+    pub fn purge_expired_memories(
+        &self,
+        ttl_seconds: u64,
+        now_unix: u64,
+    ) -> Result<usize, PersistenceError> {
+        let threshold = now_unix.saturating_sub(ttl_seconds);
+        self.conn
+            .execute(
+                "DELETE FROM memory_records WHERE created_at_unix < ?1",
+                params![threshold as i64],
+            )
+            .map(|count| count as usize)
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
+    pub fn delete_memory_record(&self, id: &str) -> Result<bool, PersistenceError> {
+        self.conn
+            .execute("DELETE FROM memory_records WHERE id = ?1", params![id])
+            .map(|affected| affected > 0)
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
+    pub fn fetch_memory_by_filters(
+        &self,
+        query: &MemoryQuery,
+    ) -> Result<Vec<MemoryRecord>, PersistenceError> {
+        self.query(query)
             .map_err(|err| PersistenceError::Sqlite(err.to_string()))
     }
 
@@ -435,55 +615,57 @@ impl SqliteMemoryStore {
 }
 
 impl MemoryStore for SqliteMemoryStore {
-    fn put(&mut self, record: MemoryRecord) {
-        let _ = self.conn.execute(
-            "INSERT OR REPLACE INTO memory_records (id, session_id, source, content, created_at_unix)
+    fn put(&mut self, record: MemoryRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO memory_records (id, session_id, source, content, created_at_unix)
             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                record.id,
-                record.session_id,
-                record.source,
-                record.content,
-                record.created_at_unix as i64
-            ],
-        );
+                params![
+                    record.id,
+                    record.session_id,
+                    record.source,
+                    record.content,
+                    record.created_at_unix as i64
+                ],
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
     }
 
-    fn query(&self, query: &MemoryQuery) -> Vec<MemoryRecord> {
-        let mut stmt = match self.conn.prepare(
-            "SELECT id, session_id, source, content, created_at_unix FROM memory_records
+    fn query(&self, query: &MemoryQuery) -> Result<Vec<MemoryRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, source, content, created_at_unix FROM memory_records
              WHERE (?1 IS NULL OR session_id = ?1)
                AND (?2 IS NULL OR source = ?2)
              ORDER BY created_at_unix DESC
              LIMIT ?3",
-        ) {
-            Ok(stmt) => stmt,
-            Err(_) => return vec![],
-        };
+            )
+            .map_err(|err| err.to_string())?;
 
-        let rows = stmt.query_map(
-            params![query.session_id, query.source, query.limit as i64],
-            |row| {
-                Ok(MemoryRecord {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    source: row.get(2)?,
-                    content: row.get(3)?,
-                    created_at_unix: row.get::<_, i64>(4)? as u64,
-                })
-            },
-        );
+        let rows = stmt
+            .query_map(
+                params![query.session_id, query.source, query.limit as i64],
+                |row| {
+                    Ok(MemoryRecord {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        source: row.get(2)?,
+                        content: row.get(3)?,
+                        created_at_unix: row.get::<_, i64>(4)? as u64,
+                    })
+                },
+            )
+            .map_err(|err| err.to_string())?;
 
-        match rows {
-            Ok(mapped) => mapped.filter_map(Result::ok).collect(),
-            Err(_) => vec![],
-        }
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
-    fn delete(&mut self, id: &str) -> bool {
+    fn delete(&mut self, id: &str) -> Result<bool, String> {
         self.conn
             .execute("DELETE FROM memory_records WHERE id = ?1", params![id])
             .map(|affected| affected > 0)
-            .unwrap_or(false)
+            .map_err(|err| err.to_string())
     }
 }

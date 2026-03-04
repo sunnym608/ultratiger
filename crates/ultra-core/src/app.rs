@@ -2,10 +2,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use tracing::{info, warn};
@@ -14,11 +14,15 @@ use crate::{
     autonomy::{next_schedule_run_unix, SchedulerTrigger, TaskItem},
     config::AppConfig,
     guardian::Guardian,
+    memory::{new_record, MemoryQuery},
     models::{
-        DeadLetterTaskResponse, ErrorResponse, GuardianResetResponse, GuardianStatusResponse,
-        HealthResponse, PermissionCheckRequest, PermissionCheckResponse, PreflightRequest,
-        PreflightResponse, QueueStatusResponse, QueueTaskRequest, RequeueDeadLetterRequest,
-        ScheduleTaskRequest, SchedulerTickResponse, SpendUpdateRequest, SpendUpdateResponse,
+        DeadLetterTaskResponse, DeleteMemoryResponse, ErrorResponse, GuardianResetResponse,
+        GuardianStatusResponse, HealthResponse, MemoryCitation, MemoryIngestRequest,
+        MemoryIngestResponse, MemoryPurgeRequest, MemoryPurgeResponse, MemoryQueryParams,
+        MemoryRecordResponse, MemoryRetrieveRequest, MemoryRetrieveResponse,
+        PermissionCheckRequest, PermissionCheckResponse, PreflightRequest, PreflightResponse,
+        QueueStatusResponse, QueueTaskRequest, RequeueDeadLetterRequest, ScheduleTaskRequest,
+        SchedulerTickResponse, SpendUpdateRequest, SpendUpdateResponse,
     },
     observability::{heartbeat, ActionLog, LogBuffer},
     permissions::requires_human_approval,
@@ -77,6 +81,11 @@ pub fn router(config: AppConfig) -> Router {
         .route("/queue/requeue", post(requeue_dead_letter))
         .route("/scheduler/register", post(register_schedule))
         .route("/scheduler/tick", post(scheduler_tick))
+        .route("/memory/ingest", post(memory_ingest))
+        .route("/memory/query", get(memory_query))
+        .route("/memory/retrieve", post(memory_retrieve))
+        .route("/memory/purge", post(memory_purge))
+        .route("/memory/:id", delete(memory_delete))
         .route("/observability/heartbeat", get(observability_heartbeat))
         .route("/observability/actions", get(observability_actions))
         .with_state(state)
@@ -403,6 +412,195 @@ async fn scheduler_tick(State(state): State<AppState>) -> impl IntoResponse {
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("scheduler tick failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn memory_ingest(
+    State(state): State<AppState>,
+    Json(request): Json<MemoryIngestRequest>,
+) -> impl IntoResponse {
+    let model = request
+        .model
+        .unwrap_or_else(|| "deterministic-v1".to_owned());
+    let chunk_size = request.chunk_size.unwrap_or(512);
+    let record_id = request.id.unwrap_or_else(|| format!("mem-{}", now_unix()));
+
+    let record = new_record(
+        record_id.clone(),
+        request.session_id,
+        request.content,
+        request.source,
+    );
+
+    let chunks_stored = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .ingest_memory_with_embeddings(&record, &model, chunk_size, 32);
+
+    match chunks_stored {
+        Ok(chunks_stored) => {
+            log_action(
+                &state,
+                "memory_ingest",
+                format!("record={} chunks={chunks_stored}", record_id),
+            );
+            (
+                StatusCode::OK,
+                Json(MemoryIngestResponse {
+                    record_id,
+                    chunks_stored,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("memory ingest failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn memory_query(
+    State(state): State<AppState>,
+    Query(params): Query<MemoryQueryParams>,
+) -> impl IntoResponse {
+    let query = MemoryQuery {
+        session_id: params.session_id,
+        source: params.source,
+        limit: params.limit.unwrap_or(20),
+    };
+
+    let result = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .fetch_memory_by_filters(&query);
+
+    match result {
+        Ok(records) => (
+            StatusCode::OK,
+            Json(
+                records
+                    .into_iter()
+                    .map(|record| MemoryRecordResponse {
+                        id: record.id,
+                        session_id: record.session_id,
+                        source: record.source,
+                        content: record.content,
+                        created_at_unix: record.created_at_unix,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("memory query failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn memory_retrieve(
+    State(state): State<AppState>,
+    Json(request): Json<MemoryRetrieveRequest>,
+) -> impl IntoResponse {
+    let model = request
+        .model
+        .unwrap_or_else(|| "deterministic-v1".to_owned());
+    let top_k = request.top_k.unwrap_or(5);
+
+    let retrieved = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .retrieve_hybrid(
+            &request.query,
+            &model,
+            request.session_id.as_deref(),
+            request.source.as_deref(),
+            top_k,
+            32,
+        );
+
+    match retrieved {
+        Ok(citations) => {
+            let response = MemoryRetrieveResponse {
+                citations: citations
+                    .into_iter()
+                    .map(|item| MemoryCitation {
+                        record_id: item.record_id,
+                        session_id: item.session_id,
+                        source: item.source,
+                        chunk_index: item.chunk_index,
+                        quote: item.chunk_text,
+                        semantic_score: item.semantic_score,
+                        keyword_score: item.keyword_score,
+                        final_score: item.final_score,
+                        created_at_unix: item.created_at_unix,
+                    })
+                    .collect(),
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("memory retrieve failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn memory_purge(
+    State(state): State<AppState>,
+    Json(request): Json<MemoryPurgeRequest>,
+) -> impl IntoResponse {
+    let deleted = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .purge_expired_memories(request.ttl_seconds, now_unix());
+
+    match deleted {
+        Ok(deleted_records) => (
+            StatusCode::OK,
+            Json(MemoryPurgeResponse { deleted_records }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("memory purge failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn memory_delete(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let deleted = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .delete_memory_record(&id);
+
+    match deleted {
+        Ok(deleted) => (StatusCode::OK, Json(DeleteMemoryResponse { deleted })).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("memory delete failed: {err}"),
             }),
         )
             .into_response(),

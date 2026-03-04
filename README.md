@@ -15,8 +15,11 @@ This repository now includes a foundational `ultra-core` Rust service that imple
 - Background scheduler + worker pool for unattended 24/7 processing
 - Exponential retry policy with jitter and max-attempt enforcement
 - Dead-letter replay/requeue API
-- Observability primitives (heartbeat + action logs)
-- Initial memory abstractions (`MemoryStore`) and `SqliteMemoryStore` for persistence
+- **Phase-3 memory + context engine**:
+  - chunking + deterministic embedding pipeline
+  - vector storage with provenance metadata
+  - hybrid retrieval (semantic + keyword ranking)
+  - memory TTL purge + delete policy endpoints
 - Phase-1 skill runtime implementation with Wasmtime engine/store/linker integration and capability-enforced host calls
 
 ## Run locally
@@ -42,51 +45,51 @@ Server starts on `0.0.0.0:3000`.
 - `POST /queue/requeue`
 - `POST /scheduler/register`
 - `POST /scheduler/tick`
+- `POST /memory/ingest`
+- `GET /memory/query`
+- `POST /memory/retrieve`
+- `POST /memory/purge`
+- `DELETE /memory/:id`
 - `GET /observability/heartbeat`
 - `GET /observability/actions`
 
-## Autonomous Orchestrator (Phase 2)
+## Memory + Context Engine (Phase 3)
 
-- Task queue persisted in SQLite (`task_queue` table)
-- Dead-letter queue persisted in SQLite (`dead_letter_queue` table)
-- Scheduled jobs persisted in SQLite (`scheduled_jobs` table)
-- Background workers run continuously using configurable concurrency (`worker_concurrency`)
-- Retry policy uses exponential backoff + jitter (`retry_base_delay_seconds`, `retry_jitter_seconds`)
-
-### Example: Register a recurring schedule (every 30 seconds)
+### Ingest memory with chunking + embeddings
 
 ```bash
-curl -X POST http://127.0.0.1:3000/scheduler/register \
+curl -X POST http://127.0.0.1:3000/memory/ingest \
   -H 'content-type: application/json' \
   -d '{
-    "id": "nightly-sync",
-    "task_type": "sync",
-    "payload": "{\"target\":\"workspace\"}",
-    "trigger_kind": "every_seconds",
-    "trigger_expr": "30",
-    "max_attempts": 5
+    "session_id": "s-001",
+    "source": "chat",
+    "content": "Ultra Tiger persists memory and retrieves relevant context.",
+    "model": "deterministic-v1",
+    "chunk_size": 128
   }'
 ```
 
-## Skill Runtime (Phase 1: Real Runtime)
+### Hybrid retrieval with citations
 
-The `skill` module now includes:
+```bash
+curl -X POST http://127.0.0.1:3000/memory/retrieve \
+  -H 'content-type: application/json' \
+  -d '{
+    "query": "how does Ultra Tiger retrieve context",
+    "session_id": "s-001",
+    "top_k": 5,
+    "model": "deterministic-v1"
+  }'
+```
 
-- signed package loading (`Manifest.json`, `skill.wasm`, `signature.sha256`)
-- Wasmtime runtime integration (engine/store/linker + WASI)
-- capability policy enforcement on host calls
-- timeout + fuel + memory guardrails
-- per-skill stdout/stderr + host-call logs
+### Retention policy purge
+
+```bash
+curl -X POST http://127.0.0.1:3000/memory/purge \
+  -H 'content-type: application/json' \
+  -d '{"ttl_seconds": 604800}'
+```
 
 ## 24/7 Deployment (systemd)
 
 A service template is included at `deployment/systemd/ultra-core.service`.
-
-Example installation:
-
-```bash
-sudo cp deployment/systemd/ultra-core.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now ultra-core
-sudo systemctl status ultra-core
-```

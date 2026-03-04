@@ -101,6 +101,80 @@ pub struct SchedulerTickResponse {
     pub fired_jobs: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryIngestRequest {
+    pub id: Option<String>,
+    pub session_id: String,
+    pub source: String,
+    pub content: String,
+    pub model: Option<String>,
+    pub chunk_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryIngestResponse {
+    pub record_id: String,
+    pub chunks_stored: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryRetrieveRequest {
+    pub query: String,
+    pub session_id: Option<String>,
+    pub source: Option<String>,
+    pub top_k: Option<usize>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryCitation {
+    pub record_id: String,
+    pub session_id: String,
+    pub source: String,
+    pub chunk_index: u32,
+    pub quote: String,
+    pub semantic_score: f32,
+    pub keyword_score: f32,
+    pub final_score: f32,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRetrieveResponse {
+    pub citations: Vec<MemoryCitation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryQueryParams {
+    pub session_id: Option<String>,
+    pub source: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRecordResponse {
+    pub id: String,
+    pub session_id: String,
+    pub source: String,
+    pub content: String,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryPurgeRequest {
+    pub ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPurgeResponse {
+    pub deleted_records: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteMemoryResponse {
+    pub deleted: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorResponse {
     pub error: String,

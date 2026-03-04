@@ -1,6 +1,6 @@
--- Ultra Tiger Memory + Orchestration Schema v2
--- Local-first layout with support for semantic retrieval, auditability,
--- and persistent autonomous queue processing.
+-- Ultra Tiger Memory + Orchestration Schema v3
+-- Local-first layout with semantic retrieval, provenance metadata,
+-- retention policy support, and persistent autonomous queue processing.
 
 CREATE TABLE IF NOT EXISTS memory_records (
   id TEXT PRIMARY KEY,
@@ -13,10 +13,12 @@ CREATE TABLE IF NOT EXISTS memory_records (
 CREATE TABLE IF NOT EXISTS memory_embeddings (
   record_id TEXT NOT NULL,
   model TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  chunk_text TEXT NOT NULL,
   dimensions INTEGER NOT NULL,
   embedding_blob BLOB NOT NULL,
   created_at_unix INTEGER NOT NULL,
-  PRIMARY KEY (record_id, model),
+  PRIMARY KEY (record_id, model, chunk_index),
   FOREIGN KEY (record_id) REFERENCES memory_records(id) ON DELETE CASCADE
 );
 
@@ -76,6 +78,9 @@ CREATE INDEX IF NOT EXISTS idx_memory_records_session_time
 
 CREATE INDEX IF NOT EXISTS idx_memory_records_source_time
   ON memory_records(source, created_at_unix DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model
+  ON memory_embeddings(model, created_at_unix DESC);
 
 CREATE INDEX IF NOT EXISTS idx_task_queue_due
   ON task_queue(status, available_at_unix);
