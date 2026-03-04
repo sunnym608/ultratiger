@@ -1,6 +1,11 @@
 pub mod app;
+pub mod autonomy;
+pub mod bridges;
 pub mod config;
 pub mod guardian;
 pub mod memory;
 pub mod models;
+pub mod observability;
 pub mod permissions;
+pub mod persistence;
+pub mod skill;

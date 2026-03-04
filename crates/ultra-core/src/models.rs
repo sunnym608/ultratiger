@@ -57,6 +57,20 @@ pub struct PermissionCheckResponse {
     pub requires_human_approval: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueTaskRequest {
+    pub id: String,
+    pub task_type: String,
+    pub payload: String,
+    pub max_attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStatusResponse {
+    pub pending: usize,
+    pub dead_letter: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorResponse {
     pub error: String,

@@ -11,7 +11,10 @@ This repository now includes a foundational `ultra-core` Rust service that imple
 - Permission gate checks for sensitive actions
 - Guardian status + manual reset controls for operational recovery
 - Axum HTTP API endpoints for health and control-plane actions
-- Initial memory abstractions (`MemoryStore`) plus an in-memory implementation for local testing
+- In-memory autonomy queue primitives (enqueue, worker tick, dead-letter)
+- Observability primitives (heartbeat + action logs)
+- Initial memory abstractions (`MemoryStore`) and `SqliteMemoryStore` for persistence
+- Wasmtime skill-host MVP primitives (manifest parser + capability validator + host-call policy checks)
 
 ## Run locally
 
@@ -29,32 +32,53 @@ Server starts on `0.0.0.0:3000`.
 - `POST /guardian/spend`
 - `POST /guardian/reset`
 - `POST /guardian/permission-check`
+- `GET /queue/status`
+- `POST /queue/enqueue`
+- `POST /queue/worker-tick`
+- `GET /observability/heartbeat`
+- `GET /observability/actions`
 
-## Memory Persistence Direction (SQLite vs Qdrant/PageIndex)
+## Skills (Wasmtime MVP Primitives)
 
-- **Operational state** (guardian budgets, approvals, audits) should remain in SQLite.
-- **Long-term semantic memory** should use a vector-friendly store:
-  - Start local with SQLite + vector extension or embedding blob table.
-  - Move to Qdrant when retrieval scale, filtering, or multi-node sync becomes important.
-- **PageIndex-style retrieval** is useful for strict document provenance, but should be layered on top of semantic retrieval, not used as a full replacement.
+The `skill` module currently provides:
 
-A starter SQL schema is provided in `sql/memory_schema.sql`.
+- `parse_manifest` for `Manifest.json` parsing
+- `validate_capabilities` for allow-list capability validation
+- `check_host_call_allowed` for host-call policy checks
 
-## What is the Wasmtime Skill Runtime?
+Supported capability prefixes:
 
-Wasmtime is the WebAssembly runtime used to execute skills in a sandbox:
+- `fs.read`
+- `fs.write`
+- `net.outbound`
+- `browser.control`
 
-- skills run in isolated Wasm modules
-- no filesystem/network access by default
-- host capabilities are explicitly granted per skill
-- runtime policy can block dangerous operations before they affect the host
+## Persistence
 
-This is the core of Ultra Tiger's "capability-based isolation" model.
+A starter SQL schema is provided in `sql/memory_schema.sql`, and `SqliteMemoryStore` initializes and uses it for:
 
-## Recommended Next Steps
+- memory records
+- approval audit events
+- guardian daily spend snapshots
 
-1. Implement a `SqliteMemoryStore` using the schema in `sql/memory_schema.sql`.
-2. Add embedding generation + retrieval traits (`Embedder`, `Retriever`) and keep provider implementations swappable.
-3. Add Wasmtime skill host with capability tokens (`fs.read`, `fs.write`, `net.outbound`, `browser.control`).
-4. Persist Guardian daily spend + approvals using the same local database.
-5. Add CI checks (`cargo test`, `clippy`, `fmt`) and release pipelines.
+## 24/7 Deployment (systemd)
+
+A service template is included at `deployment/systemd/ultra-core.service`.
+
+Example installation:
+
+```bash
+sudo cp deployment/systemd/ultra-core.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ultra-core
+sudo systemctl status ultra-core
+```
+
+## Bridge Adapters
+
+Bridge adapter scaffolds are available for:
+
+- Telegram
+- WhatsApp sidecar
+
+These are stubs for connector integration and credentials wiring.
