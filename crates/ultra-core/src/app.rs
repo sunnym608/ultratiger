@@ -12,14 +12,18 @@ use tracing::{info, warn};
 
 use crate::{
     autonomy::{next_schedule_run_unix, SchedulerTrigger, TaskItem},
+    bridges::{
+        BridgeConfig, BridgeHub, BridgesHealthResponse as InternalBridgesHealth, OutboundReply,
+    },
     config::AppConfig,
     guardian::Guardian,
     memory::{new_record, MemoryQuery},
     models::{
-        DeadLetterTaskResponse, DeleteMemoryResponse, ErrorResponse, GuardianResetResponse,
-        GuardianStatusResponse, HealthResponse, MemoryCitation, MemoryIngestRequest,
-        MemoryIngestResponse, MemoryPurgeRequest, MemoryPurgeResponse, MemoryQueryParams,
-        MemoryRecordResponse, MemoryRetrieveRequest, MemoryRetrieveResponse,
+        BridgeReplyRequest, BridgeReplyResponse, BridgeWebhookRequest, BridgeWebhookResponse,
+        BridgesHealthResponse, DeadLetterTaskResponse, DeleteMemoryResponse, ErrorResponse,
+        GuardianResetResponse, GuardianStatusResponse, HealthResponse, MemoryCitation,
+        MemoryIngestRequest, MemoryIngestResponse, MemoryPurgeRequest, MemoryPurgeResponse,
+        MemoryQueryParams, MemoryRecordResponse, MemoryRetrieveRequest, MemoryRetrieveResponse,
         PermissionCheckRequest, PermissionCheckResponse, PreflightRequest, PreflightResponse,
         QueueStatusResponse, QueueTaskRequest, RequeueDeadLetterRequest, ScheduleTaskRequest,
         SchedulerTickResponse, SpendUpdateRequest, SpendUpdateResponse,
@@ -34,6 +38,7 @@ pub struct AppState {
     guardian: Arc<Mutex<Guardian>>,
     logs: Arc<Mutex<LogBuffer>>,
     sqlite: Arc<Mutex<SqliteMemoryStore>>,
+    bridge_hub: Arc<Mutex<BridgeHub>>,
     config: AppConfig,
 }
 
@@ -41,10 +46,20 @@ impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let sqlite = SqliteMemoryStore::open("ultra_core.db")
             .expect("failed to open SQLite store for persistent orchestration");
+        let bridge_config = BridgeConfig {
+            telegram_bot_token: config.telegram_bot_token.clone(),
+            telegram_signing_secret: config.telegram_signing_secret.clone(),
+            whatsapp_api_url: config.whatsapp_api_url.clone(),
+            whatsapp_access_token: config.whatsapp_access_token.clone(),
+            whatsapp_signing_secret: config.whatsapp_signing_secret.clone(),
+            rate_limit_per_minute: config.bridge_rate_limit_per_minute,
+            outbound_max_retries: config.bridge_outbound_max_retries,
+        };
         let state = Self {
             guardian: Arc::new(Mutex::new(Guardian::new(config.clone()))),
             logs: Arc::new(Mutex::new(LogBuffer::new(500))),
             sqlite: Arc::new(Mutex::new(sqlite)),
+            bridge_hub: Arc::new(Mutex::new(BridgeHub::new(bridge_config))),
             config,
         };
         state.start_worker_pool();
@@ -86,6 +101,10 @@ pub fn router(config: AppConfig) -> Router {
         .route("/memory/retrieve", post(memory_retrieve))
         .route("/memory/purge", post(memory_purge))
         .route("/memory/:id", delete(memory_delete))
+        .route("/bridges/telegram/webhook", post(telegram_webhook))
+        .route("/bridges/whatsapp/webhook", post(whatsapp_webhook))
+        .route("/bridges/reply", post(bridge_reply))
+        .route("/bridges/health", get(bridges_health))
         .route("/observability/heartbeat", get(observability_heartbeat))
         .route("/observability/actions", get(observability_actions))
         .with_state(state)
@@ -607,6 +626,184 @@ async fn memory_delete(State(state): State<AppState>, Path(id): Path<String>) ->
     }
 }
 
+async fn telegram_webhook(
+    State(state): State<AppState>,
+    Json(request): Json<BridgeWebhookRequest>,
+) -> impl IntoResponse {
+    let payload = request.payload.to_string();
+    let normalized = state
+        .bridge_hub
+        .lock()
+        .expect("bridge hub lock poisoned")
+        .ingest_telegram_webhook(&payload, request.signature.as_deref());
+
+    match normalized {
+        Ok(event) => {
+            let task_id = format!("bridge-inbound-telegram-{}", now_unix());
+            let task = TaskItem {
+                id: task_id.clone(),
+                task_type: "bridge.inbound".to_owned(),
+                payload: serde_json::json!({
+                    "bridge": event.bridge,
+                    "user_id": event.user_id,
+                    "channel_id": event.channel_id,
+                    "text": event.text,
+                    "received_at_unix": event.received_at_unix,
+                })
+                .to_string(),
+                attempts: 0,
+                max_attempts: 5,
+                available_at_unix: now_unix(),
+            };
+
+            let _ = state
+                .sqlite
+                .lock()
+                .expect("sqlite lock poisoned")
+                .enqueue_task(&task, now_unix());
+            log_action(
+                &state,
+                "bridge_webhook_telegram",
+                format!("queued={}", task_id),
+            );
+            (
+                StatusCode::OK,
+                Json(BridgeWebhookResponse {
+                    queued_task_id: task_id,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: format!("telegram webhook rejected: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn whatsapp_webhook(
+    State(state): State<AppState>,
+    Json(request): Json<BridgeWebhookRequest>,
+) -> impl IntoResponse {
+    let payload = request.payload.to_string();
+    let normalized = state
+        .bridge_hub
+        .lock()
+        .expect("bridge hub lock poisoned")
+        .ingest_whatsapp_webhook(&payload, request.signature.as_deref());
+
+    match normalized {
+        Ok(event) => {
+            let task_id = format!("bridge-inbound-whatsapp-{}", now_unix());
+            let task = TaskItem {
+                id: task_id.clone(),
+                task_type: "bridge.inbound".to_owned(),
+                payload: serde_json::json!({
+                    "bridge": event.bridge,
+                    "user_id": event.user_id,
+                    "channel_id": event.channel_id,
+                    "text": event.text,
+                    "received_at_unix": event.received_at_unix,
+                })
+                .to_string(),
+                attempts: 0,
+                max_attempts: 5,
+                available_at_unix: now_unix(),
+            };
+
+            let _ = state
+                .sqlite
+                .lock()
+                .expect("sqlite lock poisoned")
+                .enqueue_task(&task, now_unix());
+            log_action(
+                &state,
+                "bridge_webhook_whatsapp",
+                format!("queued={}", task_id),
+            );
+            (
+                StatusCode::OK,
+                Json(BridgeWebhookResponse {
+                    queued_task_id: task_id,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: format!("whatsapp webhook rejected: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn bridge_reply(
+    State(state): State<AppState>,
+    Json(request): Json<BridgeReplyRequest>,
+) -> impl IntoResponse {
+    let task_id = format!("bridge-reply-{}", now_unix());
+    let payload = serde_json::to_string(&OutboundReply {
+        bridge: request.bridge,
+        channel_id: request.channel_id,
+        text: request.text,
+    })
+    .unwrap_or_else(|_| "{}".to_owned());
+
+    let task = TaskItem {
+        id: task_id.clone(),
+        task_type: "bridge.reply".to_owned(),
+        payload,
+        attempts: 0,
+        max_attempts: state.config.bridge_outbound_max_retries.max(1),
+        available_at_unix: now_unix(),
+    };
+
+    match state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .enqueue_task(&task, now_unix())
+    {
+        Ok(()) => {
+            log_action(&state, "bridge_reply_enqueued", format!("task={}", task_id));
+            (
+                StatusCode::OK,
+                Json(BridgeReplyResponse {
+                    queued_task_id: task_id,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("failed to queue bridge reply: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn bridges_health(State(state): State<AppState>) -> Json<BridgesHealthResponse> {
+    let health: InternalBridgesHealth = state
+        .bridge_hub
+        .lock()
+        .expect("bridge hub lock poisoned")
+        .health();
+
+    Json(BridgesHealthResponse {
+        telegram_status: health.telegram.status,
+        whatsapp_status: health.whatsapp.status,
+        telegram_inbound_events: health.telegram.inbound_events,
+        whatsapp_inbound_events: health.whatsapp.inbound_events,
+    })
+}
+
 async fn observability_heartbeat() -> Json<crate::observability::Heartbeat> {
     Json(heartbeat())
 }
@@ -634,6 +831,66 @@ fn run_single_worker_cycle(state: &AppState) {
     let Ok(Some(task)) = maybe_task else {
         return;
     };
+
+    if task.task_type == "bridge.reply" {
+        let parsed = serde_json::from_str::<OutboundReply>(&task.payload);
+        match parsed {
+            Ok(reply) => {
+                let send_result = state
+                    .bridge_hub
+                    .lock()
+                    .expect("bridge hub lock poisoned")
+                    .send_outbound_with_retry(reply);
+
+                match send_result {
+                    Ok(()) => {
+                        let _ = state
+                            .sqlite
+                            .lock()
+                            .expect("sqlite lock poisoned")
+                            .complete_task(&task.id);
+                        log_action(
+                            state,
+                            "bridge_reply_sent",
+                            format!("task={} delivered", task.id),
+                        );
+                    }
+                    Err(err) => {
+                        let _ = state
+                            .sqlite
+                            .lock()
+                            .expect("sqlite lock poisoned")
+                            .fail_task(
+                                &task,
+                                now,
+                                state.config.retry_base_delay_seconds,
+                                state.config.retry_jitter_seconds,
+                                &format!("bridge send error: {err}"),
+                            );
+                        log_action(
+                            state,
+                            "bridge_reply_retry",
+                            format!("task={} err={}", task.id, err),
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = state
+                    .sqlite
+                    .lock()
+                    .expect("sqlite lock poisoned")
+                    .fail_task(
+                        &task,
+                        now,
+                        state.config.retry_base_delay_seconds,
+                        state.config.retry_jitter_seconds,
+                        &format!("bridge payload parse error: {err}"),
+                    );
+            }
+        }
+        return;
+    }
 
     if task.payload.contains("fail") {
         let fail_result = state

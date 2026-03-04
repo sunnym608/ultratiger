@@ -16,6 +16,7 @@ sha2 = "0.10"
 hex = "0.4"
 wasmtime = "25"
 wasmtime-wasi = "25"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

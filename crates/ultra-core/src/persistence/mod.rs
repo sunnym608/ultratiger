@@ -7,7 +7,7 @@ use crate::autonomy::{
 };
 use crate::memory::{
     cosine_similarity, embed_text_deterministic, keyword_overlap_score, MemoryChunk, MemoryQuery,
-    MemoryRecord, MemoryStore, RetrievedMemory,
+    MemoryRecord, MemoryStore,
 };
 
 #[derive(Debug, Clone)]

@@ -50,6 +50,10 @@ Server starts on `0.0.0.0:3000`.
 - `POST /memory/retrieve`
 - `POST /memory/purge`
 - `DELETE /memory/:id`
+- `POST /bridges/telegram/webhook`
+- `POST /bridges/whatsapp/webhook`
+- `POST /bridges/reply`
+- `GET /bridges/health`
 - `GET /observability/heartbeat`
 - `GET /observability/actions`
 
@@ -89,6 +93,27 @@ curl -X POST http://127.0.0.1:3000/memory/purge \
   -H 'content-type: application/json' \
   -d '{"ttl_seconds": 604800}'
 ```
+
+
+## Bridges (Phase 4)
+
+Implemented bridge capabilities:
+
+- real outbound clients for Telegram/WhatsApp via HTTP APIs
+- inbound webhook normalization into queued `bridge.inbound` tasks
+- outbound reply channel with retry + backoff via `bridge.reply` tasks
+- signature verification (`sha256(secret:payload)`) for webhook protection
+- per-bridge rate limiting and health metrics
+
+Required environment variables:
+
+- `ULTRA_TELEGRAM_BOT_TOKEN`
+- `ULTRA_TELEGRAM_SIGNING_SECRET`
+- `ULTRA_WHATSAPP_API_URL`
+- `ULTRA_WHATSAPP_ACCESS_TOKEN`
+- `ULTRA_WHATSAPP_SIGNING_SECRET`
+- `ULTRA_BRIDGE_RATE_LIMIT_PER_MINUTE`
+- `ULTRA_BRIDGE_OUTBOUND_MAX_RETRIES`
 
 ## 24/7 Deployment (systemd)
 

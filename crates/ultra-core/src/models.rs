@@ -102,6 +102,37 @@ pub struct SchedulerTickResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct BridgeWebhookRequest {
+    pub payload: serde_json::Value,
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BridgeWebhookResponse {
+    pub queued_task_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BridgeReplyRequest {
+    pub bridge: String,
+    pub channel_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BridgeReplyResponse {
+    pub queued_task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BridgesHealthResponse {
+    pub telegram_status: String,
+    pub whatsapp_status: String,
+    pub telegram_inbound_events: u64,
+    pub whatsapp_inbound_events: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct MemoryIngestRequest {
     pub id: Option<String>,
     pub session_id: String,
