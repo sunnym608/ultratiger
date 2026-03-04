@@ -2,9 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::StatusCode,
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -19,14 +22,16 @@ use crate::{
     guardian::Guardian,
     memory::{new_record, MemoryQuery},
     models::{
+        ApprovalDecisionRequest, ApprovalItemResponse, AuditLogResponse, AuditQueryParams,
         BridgeReplyRequest, BridgeReplyResponse, BridgeWebhookRequest, BridgeWebhookResponse,
         BridgesHealthResponse, DeadLetterTaskResponse, DeleteMemoryResponse, ErrorResponse,
         GuardianResetResponse, GuardianStatusResponse, HealthResponse, MemoryCitation,
         MemoryIngestRequest, MemoryIngestResponse, MemoryPurgeRequest, MemoryPurgeResponse,
         MemoryQueryParams, MemoryRecordResponse, MemoryRetrieveRequest, MemoryRetrieveResponse,
-        PermissionCheckRequest, PermissionCheckResponse, PreflightRequest, PreflightResponse,
-        QueueStatusResponse, QueueTaskRequest, RequeueDeadLetterRequest, ScheduleTaskRequest,
-        SchedulerTickResponse, SpendUpdateRequest, SpendUpdateResponse,
+        MetricsResponse, PermissionCheckRequest, PermissionCheckResponse, PreflightRequest,
+        PreflightResponse, QueueStatusResponse, QueueTaskRequest, RequeueDeadLetterRequest,
+        ScheduleTaskRequest, SchedulerTickResponse, SpendUpdateRequest, SpendUpdateResponse,
+        TaskTimelineItemResponse,
     },
     observability::{heartbeat, ActionLog, LogBuffer},
     permissions::requires_human_approval,
@@ -55,6 +60,7 @@ impl AppState {
             rate_limit_per_minute: config.bridge_rate_limit_per_minute,
             outbound_max_retries: config.bridge_outbound_max_retries,
         };
+
         let state = Self {
             guardian: Arc::new(Mutex::new(Guardian::new(config.clone()))),
             logs: Arc::new(Mutex::new(LogBuffer::new(500))),
@@ -105,6 +111,13 @@ pub fn router(config: AppConfig) -> Router {
         .route("/bridges/whatsapp/webhook", post(whatsapp_webhook))
         .route("/bridges/reply", post(bridge_reply))
         .route("/bridges/health", get(bridges_health))
+        .route("/metrics", get(metrics))
+        .route("/audit/logs", get(audit_logs))
+        .route("/tasks/:id/timeline", get(task_timeline))
+        .route("/approvals/pending", get(approvals_pending))
+        .route("/approvals/:id/decision", post(approval_decision))
+        .route("/ui/approvals", get(approval_ui))
+        .route("/ws/stream", get(ws_stream))
         .route("/observability/heartbeat", get(observability_heartbeat))
         .route("/observability/actions", get(observability_actions))
         .with_state(state)
@@ -165,6 +178,8 @@ async fn register_spend(
         &state,
         "guardian_spend",
         format!("+${:.4}", request.amount_usd),
+        "info",
+        None,
     );
 
     (
@@ -189,6 +204,8 @@ async fn reset_guardian(State(state): State<AppState>) -> Json<GuardianResetResp
         &state,
         "guardian_reset",
         "daily budget state reset".to_owned(),
+        "warn",
+        None,
     );
 
     Json(GuardianResetResponse {
@@ -214,6 +231,12 @@ async fn permission_check(
             "action='{}' requires_human_approval={requires_human_approval}",
             request.action
         ),
+        if requires_human_approval {
+            "warn"
+        } else {
+            "info"
+        },
+        None,
     );
 
     Json(PermissionCheckResponse {
@@ -277,7 +300,14 @@ async fn queue_enqueue(
             .into_response();
     }
 
-    log_action(&state, "queue_enqueue", "task persisted".to_owned());
+    append_timeline(&state, &task.id, "input", &task.payload);
+    log_action(
+        &state,
+        "queue_enqueue",
+        "task persisted",
+        "info",
+        Some(&task.id),
+    );
     queue_status(State(state)).await.into_response()
 }
 
@@ -324,6 +354,8 @@ async fn requeue_dead_letter(
                 &state,
                 "requeue_dead_letter",
                 format!("requeued task {}", request.task_id),
+                "warn",
+                Some(&request.task_id),
             );
             (
                 StatusCode::OK,
@@ -395,7 +427,13 @@ async fn register_schedule(
 
     match result {
         Ok(()) => {
-            log_action(&state, "scheduler_register", format!("job={}", job.id));
+            log_action(
+                &state,
+                "scheduler_register",
+                format!("job={}", job.id),
+                "info",
+                None,
+            );
             (
                 StatusCode::OK,
                 Json(SchedulerTickResponse { fired_jobs: 0 }),
@@ -423,7 +461,13 @@ async fn scheduler_tick(State(state): State<AppState>) -> impl IntoResponse {
     match result {
         Ok(fired_jobs) => {
             if fired_jobs > 0 {
-                log_action(&state, "scheduler_tick", format!("fired_jobs={fired_jobs}"));
+                log_action(
+                    &state,
+                    "scheduler_tick",
+                    format!("fired_jobs={fired_jobs}"),
+                    "info",
+                    None,
+                );
             }
             (StatusCode::OK, Json(SchedulerTickResponse { fired_jobs })).into_response()
         }
@@ -466,6 +510,8 @@ async fn memory_ingest(
                 &state,
                 "memory_ingest",
                 format!("record={} chunks={chunks_stored}", record_id),
+                "info",
+                Some(&record_id),
             );
             (
                 StatusCode::OK,
@@ -583,7 +629,7 @@ async fn memory_retrieve(
 
 async fn memory_purge(
     State(state): State<AppState>,
-    Json(request): Json<MemoryPurgeRequest>,
+    Json(request): Json<crate::models::MemoryPurgeRequest>,
 ) -> impl IntoResponse {
     let deleted = state
         .sqlite
@@ -594,7 +640,7 @@ async fn memory_purge(
     match deleted {
         Ok(deleted_records) => (
             StatusCode::OK,
-            Json(MemoryPurgeResponse { deleted_records }),
+            Json(crate::models::MemoryPurgeResponse { deleted_records }),
         )
             .into_response(),
         Err(err) => (
@@ -640,17 +686,18 @@ async fn telegram_webhook(
     match normalized {
         Ok(event) => {
             let task_id = format!("bridge-inbound-telegram-{}", now_unix());
+            let payload = serde_json::json!({
+                "bridge": event.bridge,
+                "user_id": event.user_id,
+                "channel_id": event.channel_id,
+                "text": event.text,
+                "received_at_unix": event.received_at_unix,
+            })
+            .to_string();
             let task = TaskItem {
                 id: task_id.clone(),
                 task_type: "bridge.inbound".to_owned(),
-                payload: serde_json::json!({
-                    "bridge": event.bridge,
-                    "user_id": event.user_id,
-                    "channel_id": event.channel_id,
-                    "text": event.text,
-                    "received_at_unix": event.received_at_unix,
-                })
-                .to_string(),
+                payload: payload.clone(),
                 attempts: 0,
                 max_attempts: 5,
                 available_at_unix: now_unix(),
@@ -661,10 +708,13 @@ async fn telegram_webhook(
                 .lock()
                 .expect("sqlite lock poisoned")
                 .enqueue_task(&task, now_unix());
+            append_timeline(&state, &task_id, "input", &payload);
             log_action(
                 &state,
                 "bridge_webhook_telegram",
                 format!("queued={}", task_id),
+                "info",
+                Some(&task_id),
             );
             (
                 StatusCode::OK,
@@ -698,17 +748,18 @@ async fn whatsapp_webhook(
     match normalized {
         Ok(event) => {
             let task_id = format!("bridge-inbound-whatsapp-{}", now_unix());
+            let payload = serde_json::json!({
+                "bridge": event.bridge,
+                "user_id": event.user_id,
+                "channel_id": event.channel_id,
+                "text": event.text,
+                "received_at_unix": event.received_at_unix,
+            })
+            .to_string();
             let task = TaskItem {
                 id: task_id.clone(),
                 task_type: "bridge.inbound".to_owned(),
-                payload: serde_json::json!({
-                    "bridge": event.bridge,
-                    "user_id": event.user_id,
-                    "channel_id": event.channel_id,
-                    "text": event.text,
-                    "received_at_unix": event.received_at_unix,
-                })
-                .to_string(),
+                payload: payload.clone(),
                 attempts: 0,
                 max_attempts: 5,
                 available_at_unix: now_unix(),
@@ -719,10 +770,13 @@ async fn whatsapp_webhook(
                 .lock()
                 .expect("sqlite lock poisoned")
                 .enqueue_task(&task, now_unix());
+            append_timeline(&state, &task_id, "input", &payload);
             log_action(
                 &state,
                 "bridge_webhook_whatsapp",
                 format!("queued={}", task_id),
+                "info",
+                Some(&task_id),
             );
             (
                 StatusCode::OK,
@@ -757,7 +811,7 @@ async fn bridge_reply(
     let task = TaskItem {
         id: task_id.clone(),
         task_type: "bridge.reply".to_owned(),
-        payload,
+        payload: payload.clone(),
         attempts: 0,
         max_attempts: state.config.bridge_outbound_max_retries.max(1),
         available_at_unix: now_unix(),
@@ -770,7 +824,14 @@ async fn bridge_reply(
         .enqueue_task(&task, now_unix())
     {
         Ok(()) => {
-            log_action(&state, "bridge_reply_enqueued", format!("task={}", task_id));
+            append_timeline(&state, &task_id, "input", &payload);
+            log_action(
+                &state,
+                "bridge_reply_enqueued",
+                format!("task={}", task_id),
+                "info",
+                Some(&task_id),
+            );
             (
                 StatusCode::OK,
                 Json(BridgeReplyResponse {
@@ -804,6 +865,300 @@ async fn bridges_health(State(state): State<AppState>) -> Json<BridgesHealthResp
     })
 }
 
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshot = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .metrics_snapshot();
+
+    match snapshot {
+        Ok(m) => (
+            StatusCode::OK,
+            Json(MetricsResponse {
+                queue_pending: m.queue_pending,
+                queue_dead_letter: m.queue_dead_letter,
+                task_failures_total: m.task_failures_total,
+                approvals_pending: m.approvals_pending,
+                spend_today_usd: m.spend_today_usd,
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("metrics failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn audit_logs(
+    State(state): State<AppState>,
+    Query(params): Query<AuditQueryParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let rows = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .list_audit_logs(limit);
+
+    match rows {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(
+                rows.into_iter()
+                    .map(|r| AuditLogResponse {
+                        id: r.id,
+                        action: r.action,
+                        detail: r.detail,
+                        severity: r.severity,
+                        task_id: r.task_id,
+                        created_at_unix: r.created_at_unix,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("audit logs failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn task_timeline(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let rows = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .get_task_timeline(&id);
+
+    match rows {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(
+                rows.into_iter()
+                    .map(|r| TaskTimelineItemResponse {
+                        stage: r.stage,
+                        payload: r.payload,
+                        created_at_unix: r.created_at_unix,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("task timeline failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn approvals_pending(State(state): State<AppState>) -> impl IntoResponse {
+    let rows = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .list_pending_approvals(200);
+
+    match rows {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(
+                rows.into_iter()
+                    .map(|r| ApprovalItemResponse {
+                        id: r.id,
+                        action: r.action,
+                        decision: r.decision,
+                        actor: r.actor,
+                        reason: r.reason,
+                        created_at_unix: r.created_at_unix,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("approvals fetch failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn approval_decision(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ApprovalDecisionRequest>,
+) -> impl IntoResponse {
+    let decision = request.decision.to_lowercase();
+    if decision != "approved" && decision != "rejected" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "decision must be 'approved' or 'rejected'".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+
+    let result = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .set_approval_decision(
+            &id,
+            &decision,
+            &request.actor,
+            request.reason.as_deref(),
+            now_unix(),
+        );
+
+    match result {
+        Ok(true) => {
+            log_action(
+                &state,
+                "approval_decision",
+                format!("approval={} decision={}", id, decision),
+                "warn",
+                None,
+            );
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "approval item not found".to_owned(),
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("approval update failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn approval_ui() -> Html<String> {
+    Html(
+        r#"<!doctype html>
+<html>
+<head>
+  <meta charset='utf-8' />
+  <title>Ultra Tiger - Approval Queue</title>
+  <style>
+    body { font-family: Inter, Arial, sans-serif; margin: 20px; background:#0b1020; color:#e6e8ef; }
+    .card { background:#151c33; border:1px solid #2a355f; border-radius:10px; padding:14px; margin-bottom:12px; }
+    button { margin-right:8px; padding:8px 12px; border-radius:8px; border:0; cursor:pointer; }
+    .ok { background:#2ecc71; color:#071d0f; }
+    .no { background:#ff6b6b; color:#2a0707; }
+    code { color:#9dc1ff; }
+  </style>
+</head>
+<body>
+  <h1>Approval Queue</h1>
+  <p>Pending sensitive actions requiring HITL decision.</p>
+  <div id='list'></div>
+  <script>
+    async function load() {
+      const res = await fetch('/approvals/pending');
+      const items = await res.json();
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      if (!items.length) { list.innerHTML = '<div class="card">No pending approvals.</div>'; return; }
+      for (const item of items) {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.innerHTML = `<div><b>ID:</b> <code>${item.id}</code></div><div><b>Action:</b> ${item.action}</div>`;
+        const approve = document.createElement('button');
+        approve.className = 'ok';
+        approve.textContent = 'Approve';
+        approve.onclick = () => decide(item.id, 'approved');
+        const reject = document.createElement('button');
+        reject.className = 'no';
+        reject.textContent = 'Reject';
+        reject.onclick = () => decide(item.id, 'rejected');
+        card.appendChild(approve);
+        card.appendChild(reject);
+        list.appendChild(card);
+      }
+    }
+    async function decide(id, decision) {
+      await fetch(`/approvals/${id}/decision`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ decision, actor: 'ui-operator', reason: 'manual-review' })
+      });
+      load();
+    }
+    load();
+    setInterval(load, 3000);
+  </script>
+</body>
+</html>"#
+            .to_owned(),
+    )
+}
+
+async fn ws_stream(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        stream_socket(socket, state).await;
+    })
+}
+
+async fn stream_socket(mut socket: WebSocket, state: AppState) {
+    loop {
+        let heartbeat = heartbeat();
+        let metrics = state
+            .sqlite
+            .lock()
+            .expect("sqlite lock poisoned")
+            .metrics_snapshot();
+
+        let payload = match metrics {
+            Ok(m) => serde_json::json!({
+                "type": "heartbeat",
+                "heartbeat": heartbeat,
+                "metrics": {
+                    "queue_pending": m.queue_pending,
+                    "queue_dead_letter": m.queue_dead_letter,
+                    "task_failures_total": m.task_failures_total,
+                    "approvals_pending": m.approvals_pending,
+                    "spend_today_usd": m.spend_today_usd,
+                }
+            }),
+            Err(err) => serde_json::json!({
+                "type": "heartbeat",
+                "heartbeat": heartbeat,
+                "error": err.to_string()
+            }),
+        };
+
+        if socket
+            .send(Message::Text(payload.to_string()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 async fn observability_heartbeat() -> Json<crate::observability::Heartbeat> {
     Json(heartbeat())
 }
@@ -832,6 +1187,8 @@ fn run_single_worker_cycle(state: &AppState) {
         return;
     };
 
+    append_timeline(state, &task.id, "tools", "worker claimed task");
+
     if task.task_type == "bridge.reply" {
         let parsed = serde_json::from_str::<OutboundReply>(&task.payload);
         match parsed {
@@ -849,10 +1206,13 @@ fn run_single_worker_cycle(state: &AppState) {
                             .lock()
                             .expect("sqlite lock poisoned")
                             .complete_task(&task.id);
+                        append_timeline(state, &task.id, "output", "bridge message delivered");
                         log_action(
                             state,
                             "bridge_reply_sent",
                             format!("task={} delivered", task.id),
+                            "info",
+                            Some(&task.id),
                         );
                     }
                     Err(err) => {
@@ -867,10 +1227,18 @@ fn run_single_worker_cycle(state: &AppState) {
                                 state.config.retry_jitter_seconds,
                                 &format!("bridge send error: {err}"),
                             );
+                        append_timeline(
+                            state,
+                            &task.id,
+                            "output",
+                            &format!("bridge delivery failed: {err}"),
+                        );
                         log_action(
                             state,
                             "bridge_reply_retry",
                             format!("task={} err={}", task.id, err),
+                            "warn",
+                            Some(&task.id),
                         );
                     }
                 }
@@ -906,11 +1274,16 @@ fn run_single_worker_cycle(state: &AppState) {
             );
 
         match fail_result {
-            Ok(()) => log_action(
-                state,
-                "worker_retry",
-                format!("task={} attempt={}", task.id, task.attempts + 1),
-            ),
+            Ok(()) => {
+                append_timeline(state, &task.id, "output", "task retry scheduled");
+                log_action(
+                    state,
+                    "worker_retry",
+                    format!("task={} attempt={}", task.id, task.attempts + 1),
+                    "warn",
+                    Some(&task.id),
+                )
+            }
             Err(err) => warn!("failed to persist retry state for task {}: {err}", task.id),
         }
         return;
@@ -923,11 +1296,16 @@ fn run_single_worker_cycle(state: &AppState) {
         .complete_task(&task.id);
 
     match complete_result {
-        Ok(()) => log_action(
-            state,
-            "worker_complete",
-            format!("task={} complete", task.id),
-        ),
+        Ok(()) => {
+            append_timeline(state, &task.id, "output", "task complete");
+            log_action(
+                state,
+                "worker_complete",
+                format!("task={} complete", task.id),
+                "info",
+                Some(&task.id),
+            )
+        }
         Err(err) => warn!("failed to mark task complete {}: {err}", task.id),
     }
 }
@@ -950,7 +1328,7 @@ fn persist_guardian_snapshot(state: &AppState, total_spent_usd: f64, keys_revoke
 
 fn append_approval_event(state: &AppState, action: &str, decision: &str) {
     let event = ApprovalEvent {
-        id: format!("approval-{}", now_unix()),
+        id: format!("approval-{}", now_millis()),
         action: action.to_owned(),
         decision: decision.to_owned(),
         actor: "system".to_owned(),
@@ -964,12 +1342,44 @@ fn append_approval_event(state: &AppState, action: &str, decision: &str) {
         .append_approval_event(&event);
 }
 
-fn log_action(state: &AppState, action: impl Into<String>, detail: impl Into<String>) {
+fn append_timeline(state: &AppState, task_id: &str, stage: &str, payload: &str) {
+    let id = format!("timeline-{}-{}", task_id, now_millis());
+    let _ = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .append_task_timeline(&id, task_id, stage, payload, now_unix());
+}
+
+fn log_action(
+    state: &AppState,
+    action: impl Into<String>,
+    detail: impl Into<String>,
+    severity: &str,
+    task_id: Option<&str>,
+) {
+    let action = action.into();
+    let detail = detail.into();
+
     state
         .logs
         .lock()
         .expect("log lock poisoned")
-        .push(action, detail);
+        .push(action.clone(), detail.clone());
+
+    let id = format!("audit-{}", now_millis());
+    let _ = state
+        .sqlite
+        .lock()
+        .expect("sqlite lock poisoned")
+        .append_audit_log(&id, &action, &detail, severity, task_id, now_unix());
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn now_unix() -> u64 {

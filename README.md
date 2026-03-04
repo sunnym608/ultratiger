@@ -54,6 +54,13 @@ Server starts on `0.0.0.0:3000`.
 - `POST /bridges/whatsapp/webhook`
 - `POST /bridges/reply`
 - `GET /bridges/health`
+- `GET /metrics`
+- `GET /audit/logs`
+- `GET /tasks/:id/timeline`
+- `GET /approvals/pending`
+- `POST /approvals/:id/decision`
+- `GET /ui/approvals`
+- `GET /ws/stream`
 - `GET /observability/heartbeat`
 - `GET /observability/actions`
 
@@ -114,6 +121,27 @@ Required environment variables:
 - `ULTRA_WHATSAPP_SIGNING_SECRET`
 - `ULTRA_BRIDGE_RATE_LIMIT_PER_MINUTE`
 - `ULTRA_BRIDGE_OUTBOUND_MAX_RETRIES`
+
+
+## Observability + HITL UX (Phase 5)
+
+Implemented production operations features:
+
+- persistent audit logs (`audit_logs`) replacing ephemeral-only action history
+- per-task timeline (`task_timeline`) for lifecycle inspection (input -> tools -> output)
+- metrics endpoint for backlog/failures/spend/approval queue depth
+- approval queue APIs + browser UI for pending/approve/reject workflows
+- live WebSocket stream for heartbeat + metrics updates (`/ws/stream`)
+
+Quick checks:
+
+```bash
+curl http://127.0.0.1:3000/metrics
+curl http://127.0.0.1:3000/audit/logs?limit=50
+curl http://127.0.0.1:3000/approvals/pending
+```
+
+Open approval UI in browser: `http://127.0.0.1:3000/ui/approvals`.
 
 ## 24/7 Deployment (systemd)
 

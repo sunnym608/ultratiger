@@ -1,6 +1,5 @@
--- Ultra Tiger Memory + Orchestration Schema v3
--- Local-first layout with semantic retrieval, provenance metadata,
--- retention policy support, and persistent autonomous queue processing.
+-- Ultra Tiger Memory + Orchestration Schema v4
+-- Adds persistent audit logs, task timeline, and HITL queue support.
 
 CREATE TABLE IF NOT EXISTS memory_records (
   id TEXT PRIMARY KEY,
@@ -28,7 +27,8 @@ CREATE TABLE IF NOT EXISTS approval_events (
   decision TEXT NOT NULL,
   actor TEXT NOT NULL,
   reason TEXT,
-  created_at_unix INTEGER NOT NULL
+  created_at_unix INTEGER NOT NULL,
+  updated_at_unix INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS guardian_daily_spend (
@@ -73,6 +73,23 @@ CREATE TABLE IF NOT EXISTS dead_letter_queue (
   failed_at_unix INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id TEXT PRIMARY KEY,
+  action TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  task_id TEXT,
+  created_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_timeline (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at_unix INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_memory_records_session_time
   ON memory_records(session_id, created_at_unix DESC);
 
@@ -87,3 +104,12 @@ CREATE INDEX IF NOT EXISTS idx_task_queue_due
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
   ON scheduled_jobs(enabled, next_run_unix);
+
+CREATE INDEX IF NOT EXISTS idx_approval_pending
+  ON approval_events(decision, created_at_unix DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created
+  ON audit_logs(created_at_unix DESC);
+
+CREATE INDEX IF NOT EXISTS idx_task_timeline
+  ON task_timeline(task_id, created_at_unix ASC);

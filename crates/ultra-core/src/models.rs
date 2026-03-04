@@ -207,6 +207,54 @@ pub struct DeleteMemoryResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AuditLogResponse {
+    pub id: String,
+    pub action: String,
+    pub detail: String,
+    pub severity: String,
+    pub task_id: Option<String>,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditQueryParams {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskTimelineItemResponse {
+    pub stage: String,
+    pub payload: String,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsResponse {
+    pub queue_pending: usize,
+    pub queue_dead_letter: usize,
+    pub task_failures_total: usize,
+    pub approvals_pending: usize,
+    pub spend_today_usd: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalDecisionRequest {
+    pub decision: String,
+    pub actor: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalItemResponse {
+    pub id: String,
+    pub action: String,
+    pub decision: String,
+    pub actor: String,
+    pub reason: Option<String>,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
 }

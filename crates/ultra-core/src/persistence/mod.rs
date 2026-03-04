@@ -21,6 +21,33 @@ pub struct ApprovalEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct ApprovalItem {
+    pub id: String,
+    pub action: String,
+    pub decision: String,
+    pub actor: String,
+    pub reason: Option<String>,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditLogItem {
+    pub id: String,
+    pub action: String,
+    pub detail: String,
+    pub severity: String,
+    pub task_id: Option<String>,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskTimelineItem {
+    pub stage: String,
+    pub payload: String,
+    pub created_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ScheduledJob {
     pub id: String,
     pub task_type: String,
@@ -61,6 +88,15 @@ pub struct MemoryRetrievalResult {
     pub created_at_unix: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct OpsMetrics {
+    pub queue_pending: usize,
+    pub queue_dead_letter: usize,
+    pub task_failures_total: usize,
+    pub approvals_pending: usize,
+    pub spend_today_usd: f64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
     #[error("sqlite error: {0}")]
@@ -88,6 +124,158 @@ impl SqliteMemoryStore {
             .map_err(|err| PersistenceError::Sqlite(err.to_string()))
     }
 
+    pub fn append_audit_log(
+        &self,
+        id: &str,
+        action: &str,
+        detail: &str,
+        severity: &str,
+        task_id: Option<&str>,
+        created_at_unix: u64,
+    ) -> Result<(), PersistenceError> {
+        self.conn
+            .execute(
+                "INSERT INTO audit_logs (id, action, detail, severity, task_id, created_at_unix)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    action,
+                    detail,
+                    severity,
+                    task_id,
+                    created_at_unix as i64
+                ],
+            )
+            .map(|_| ())
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
+    pub fn list_audit_logs(&self, limit: usize) -> Result<Vec<AuditLogItem>, PersistenceError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, action, detail, severity, task_id, created_at_unix
+                 FROM audit_logs ORDER BY created_at_unix DESC LIMIT ?1",
+            )
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(AuditLogItem {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    detail: row.get(2)?,
+                    severity: row.get(3)?,
+                    task_id: row.get(4)?,
+                    created_at_unix: row.get::<_, i64>(5)? as u64,
+                })
+            })
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn append_task_timeline(
+        &self,
+        id: &str,
+        task_id: &str,
+        stage: &str,
+        payload: &str,
+        created_at_unix: u64,
+    ) -> Result<(), PersistenceError> {
+        self.conn
+            .execute(
+                "INSERT INTO task_timeline (id, task_id, stage, payload, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, task_id, stage, payload, created_at_unix as i64],
+            )
+            .map(|_| ())
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
+    pub fn get_task_timeline(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<TaskTimelineItem>, PersistenceError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT stage, payload, created_at_unix FROM task_timeline
+                 WHERE task_id = ?1 ORDER BY created_at_unix ASC",
+            )
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![task_id], |row| {
+                Ok(TaskTimelineItem {
+                    stage: row.get(0)?,
+                    payload: row.get(1)?,
+                    created_at_unix: row.get::<_, i64>(2)? as u64,
+                })
+            })
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn list_pending_approvals(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ApprovalItem>, PersistenceError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, action, decision, actor, reason, created_at_unix
+                 FROM approval_events WHERE decision = 'pending'
+                 ORDER BY created_at_unix DESC LIMIT ?1",
+            )
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(ApprovalItem {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    decision: row.get(2)?,
+                    actor: row.get(3)?,
+                    reason: row.get(4)?,
+                    created_at_unix: row.get::<_, i64>(5)? as u64,
+                })
+            })
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn set_approval_decision(
+        &self,
+        id: &str,
+        decision: &str,
+        actor: &str,
+        reason: Option<&str>,
+        now_unix: u64,
+    ) -> Result<bool, PersistenceError> {
+        self.conn
+            .execute(
+                "UPDATE approval_events
+                 SET decision = ?2, actor = ?3, reason = ?4, updated_at_unix = ?5
+                 WHERE id = ?1",
+                params![id, decision, actor, reason, now_unix as i64],
+            )
+            .map(|affected| affected > 0)
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
+    pub fn approvals_pending_count(&self) -> Result<usize, PersistenceError> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM approval_events WHERE decision = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| v as usize)
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
     pub fn persist_guardian_daily_spend(
         &self,
         spend_date: &str,
@@ -109,11 +297,23 @@ impl SqliteMemoryStore {
             .map_err(|err| PersistenceError::Sqlite(err.to_string()))
     }
 
+    pub fn latest_spend_total(&self) -> Result<f64, PersistenceError> {
+        self.conn
+            .query_row(
+                "SELECT total_spent_usd FROM guardian_daily_spend ORDER BY updated_at_unix DESC LIMIT 1",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .optional()
+            .map(|opt| opt.unwrap_or(0.0))
+            .map_err(|err| PersistenceError::Sqlite(err.to_string()))
+    }
+
     pub fn append_approval_event(&self, event: &ApprovalEvent) -> Result<(), PersistenceError> {
         self.conn
             .execute(
-                "INSERT INTO approval_events (id, action, decision, actor, reason, created_at_unix)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO approval_events (id, action, decision, actor, reason, created_at_unix, updated_at_unix)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
                 params![
                     event.id,
                     event.action,
@@ -611,6 +811,26 @@ impl SqliteMemoryStore {
         }
 
         Ok(fired)
+    }
+
+    pub fn metrics_snapshot(&self) -> Result<OpsMetrics, PersistenceError> {
+        let counts = self.queue_counts()?;
+        let failures =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM dead_letter_queue", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|err| PersistenceError::Sqlite(err.to_string()))? as usize;
+        let approvals_pending = self.approvals_pending_count()?;
+        let spend_today_usd = self.latest_spend_total()?;
+
+        Ok(OpsMetrics {
+            queue_pending: counts.pending,
+            queue_dead_letter: counts.dead_letter,
+            task_failures_total: failures,
+            approvals_pending,
+            spend_today_usd,
+        })
     }
 }
 
