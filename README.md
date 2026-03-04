@@ -14,7 +14,7 @@ This repository now includes a foundational `ultra-core` Rust service that imple
 - In-memory autonomy queue primitives (enqueue, worker tick, dead-letter)
 - Observability primitives (heartbeat + action logs)
 - Initial memory abstractions (`MemoryStore`) and `SqliteMemoryStore` for persistence
-- Wasmtime skill-host MVP primitives (manifest parser + capability validator + host-call policy checks)
+- Phase-1 skill runtime implementation with Wasmtime engine/store/linker integration and capability-enforced host calls
 
 ## Run locally
 
@@ -38,20 +38,30 @@ Server starts on `0.0.0.0:3000`.
 - `GET /observability/heartbeat`
 - `GET /observability/actions`
 
-## Skills (Wasmtime MVP Primitives)
+## Skill Runtime (Phase 1: Real Runtime)
 
-The `skill` module currently provides:
+The `skill` module now includes:
 
-- `parse_manifest` for `Manifest.json` parsing
-- `validate_capabilities` for allow-list capability validation
-- `check_host_call_allowed` for host-call policy checks
-
-Supported capability prefixes:
-
-- `fs.read`
-- `fs.write`
-- `net.outbound`
-- `browser.control`
+- **signed package loading** from a package directory:
+  - `Manifest.json`
+  - `skill.wasm`
+  - `signature.sha256` (SHA-256 of `skill.wasm`)
+- **Wasmtime runtime integration**:
+  - engine/store/linker setup
+  - WASI context
+  - `.wasm` module loading and entrypoint execution (`run` or `_start`)
+- **capability policy enforcement on host calls**:
+  - `host_fs_read`
+  - `host_fs_write`
+  - `host_http_request`
+  - `host_browser_control`
+- **runtime guardrails**:
+  - execution timeout
+  - fuel-based interruption guard
+  - memory-size limiter
+- **execution telemetry**:
+  - per-skill host-call logs
+  - captured stdout/stderr output
 
 ## Persistence
 

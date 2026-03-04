@@ -1,41 +1,40 @@
-# Wasmtime Skill Runtime (Design Note)
+# Wasmtime Skill Runtime (Phase 1 Implemented)
 
-This document defines the initial design for running Ultra Tiger skills securely.
+This document describes the implemented Phase-1 runtime and what follows next.
 
-## Goals
+## Implemented in Phase 1
 
-- Execute untrusted third-party skills with strict isolation.
-- Enforce least-privilege capability grants at runtime.
-- Keep execution deterministic and auditable for HITL workflows.
+- Wasmtime engine/store/linker integration.
+- Signed package loading from a directory containing:
+  - `Manifest.json`
+  - `skill.wasm`
+  - `signature.sha256` (SHA-256 of wasm payload)
+- Capability validation against allow-listed prefixes.
+- Host-call policy enforcement for every shimmed call:
+  - `host_fs_read`
+  - `host_fs_write`
+  - `host_http_request`
+  - `host_browser_control`
+- Runtime guardrails:
+  - timeout wrapper around execution
+  - fuel guard for interruption
+  - memory size limiter
+- Per-skill output and structured execution logs:
+  - captured stdout/stderr from WASI pipes
+  - host-call allow/deny log entries
 
-## Runtime Model
+## Runtime Flow
 
-1. Skill package includes:
-   - `Manifest.json` (declared capabilities)
-   - Wasm module (`.wasm`)
-   - optional UI metadata
-2. Ultra Core validates manifest against policy.
-3. Host creates a Wasmtime store with only approved imports.
-4. Skill executes with explicit host calls (`host_fs_read`, `host_http_request`, etc.).
-5. Every privileged host call is logged for audit and optional approval.
+1. Load and parse `Manifest.json`.
+2. Verify `skill.wasm` against `signature.sha256`.
+3. Validate declared capabilities.
+4. Build Wasmtime runtime and register host shims.
+5. Execute `run` or fallback to `_start`.
+6. Return stdout/stderr and host-call logs.
 
-## Capability Examples
+## Next (Phase 2+)
 
-- `fs.read:/documents/work`
-- `fs.write:/documents/work/reports`
-- `net.outbound:api.openai.com:443`
-- `browser.control`
-
-## Enforcement Notes
-
-- Unknown capabilities are rejected.
-- Missing required capability causes host call failure.
-- High-risk capabilities trigger HITL approval gate before execution.
-
-## Next Code Tasks
-
-- Add `skill` module with:
-  - manifest parser
-  - capability validator
-  - host-call authorization middleware
-- Add integration test fixtures with safe and unsafe skills.
+- Replace checksum-only signature with asymmetric signing/verification.
+- Add strict path/domain-scoped capability checks (not prefix-only).
+- Add richer host API ABI with argument marshalling and typed responses.
+- Add integration tests with real wasm fixtures and malicious behavior cases.

@@ -1,5 +1,11 @@
+mod package;
+mod runtime;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+pub use package::{load_signed_package, SkillPackage};
+pub use runtime::{execute_signed_skill, SkillExecutionResult, SkillRuntimeConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillManifest {
@@ -25,6 +31,10 @@ pub enum SkillError {
     UnknownCapability(String),
     #[error("missing required capability: {0}")]
     MissingCapability(String),
+    #[error("package load error: {0}")]
+    Package(String),
+    #[error("runtime error: {0}")]
+    Runtime(String),
 }
 
 const ALLOWED_CAPABILITIES: &[&str] = &["fs.read", "fs.write", "net.outbound", "browser.control"];
@@ -69,11 +79,15 @@ pub fn check_host_call_allowed(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use sha2::{Digest, Sha256};
+
     use super::*;
 
     #[test]
     fn parser_and_validator_work() {
-        let raw = r#"{"name":"demo","version":"0.1.0","entrypoint":"main","capabilities":["fs.read:/tmp"]}"#;
+        let raw = r#"{"name":"demo","version":"0.1.0","entrypoint":"run","capabilities":["fs.read:/tmp"]}"#;
         let manifest = parse_manifest(raw).expect("manifest should parse");
         validate_capabilities(&manifest).expect("capability should be valid");
         check_host_call_allowed(&manifest, HostCall::FsRead).expect("fs.read should be allowed");
@@ -81,9 +95,33 @@ mod tests {
 
     #[test]
     fn invalid_capability_rejected() {
-        let raw = r#"{"name":"demo","version":"0.1.0","entrypoint":"main","capabilities":["shell.exec"]}"#;
+        let raw =
+            r#"{"name":"demo","version":"0.1.0","entrypoint":"run","capabilities":["shell.exec"]}"#;
         let manifest = parse_manifest(raw).expect("manifest should parse");
         let err = validate_capabilities(&manifest).expect_err("unknown capability should fail");
         assert!(err.to_string().contains("unknown capability"));
+    }
+
+    #[test]
+    fn signed_package_loader_verifies_sha256() {
+        let tmp = std::env::temp_dir().join("ultra_skill_test_pkg");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("temp dir should be created");
+
+        fs::write(
+            tmp.join("Manifest.json"),
+            r#"{"name":"demo","version":"0.1.0","entrypoint":"run","capabilities":["fs.read:/tmp"]}"#,
+        )
+        .expect("manifest written");
+        let wasm_bytes = b"not-real-wasm";
+        fs::write(tmp.join("skill.wasm"), wasm_bytes).expect("wasm written");
+
+        let checksum = hex::encode(Sha256::digest(wasm_bytes));
+        fs::write(tmp.join("signature.sha256"), checksum).expect("signature written");
+
+        let package = load_signed_package(&tmp).expect("signed package should load");
+        assert_eq!(package.manifest.name, "demo");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
