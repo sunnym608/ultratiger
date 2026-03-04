@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -45,6 +48,7 @@ pub struct AppState {
     sqlite: Arc<Mutex<SqliteMemoryStore>>,
     bridge_hub: Arc<Mutex<BridgeHub>>,
     config: AppConfig,
+    readiness: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -67,9 +71,31 @@ impl AppState {
             sqlite: Arc::new(Mutex::new(sqlite)),
             bridge_hub: Arc::new(Mutex::new(BridgeHub::new(bridge_config))),
             config,
+            readiness: Arc::new(AtomicBool::new(true)),
         };
         state.start_worker_pool();
         state
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.readiness.load(Ordering::SeqCst)
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.readiness.store(false, Ordering::SeqCst);
+        let now = now_unix();
+        let _ = self
+            .sqlite
+            .lock()
+            .expect("sqlite lock poisoned")
+            .append_audit_log(
+                &format!("audit-shutdown-{}", now_millis()),
+                "shutdown",
+                "received shutdown signal; flushing state",
+                "warn",
+                None,
+                now,
+            );
     }
 
     fn start_worker_pool(&self) {
@@ -86,10 +112,12 @@ impl AppState {
     }
 }
 
-pub fn router(config: AppConfig) -> Router {
+pub fn router(config: AppConfig) -> (Router, AppState) {
     let state = AppState::new(config);
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
+        .route("/health/liveness", get(liveness))
+        .route("/health/readiness", get(readiness))
         .route("/guardian/status", get(guardian_status))
         .route("/guardian/preflight", post(preflight))
         .route("/guardian/spend", post(register_spend))
@@ -120,7 +148,9 @@ pub fn router(config: AppConfig) -> Router {
         .route("/ws/stream", get(ws_stream))
         .route("/observability/heartbeat", get(observability_heartbeat))
         .route("/observability/actions", get(observability_actions))
-        .with_state(state)
+        .with_state(state.clone());
+
+    (router, state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -128,6 +158,34 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "ultra-core",
     })
+}
+
+async fn liveness() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "alive",
+        service: "ultra-core",
+    })
+}
+
+async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    if state.is_ready() {
+        (
+            StatusCode::OK,
+            Json(HealthResponse {
+                status: "ready",
+                service: "ultra-core",
+            }),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "service is shutting down".to_owned(),
+            }),
+        )
+            .into_response()
+    }
 }
 
 async fn guardian_status(State(state): State<AppState>) -> Json<GuardianStatusResponse> {
