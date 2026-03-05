@@ -1,0 +1,21 @@
+[Unit]
+Description=Ultra Tiger Core Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ultratiger
+ExecStart=/opt/ultratiger/target/release/ultra-core
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=ultra_core=info
+
+# Security hardening baseline
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ultratiger
+
+[Install]
+WantedBy=multi-user.target
